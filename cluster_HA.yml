@@ -1,0 +1,137 @@
+---
+- name: Configuracion de cluster HA de NGINX utilizando Pacemaker y Corosync
+  hosts: all
+  become: yes
+  tasks: 
+    - name: Editar fichero /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ item }}"
+        state: present
+      loop:
+        - "{{ hostvars['nodo1']['ansible_host'] }} nodo1"
+        - "{{ hostvars['nodo2']['ansible_host'] }} nodo2"
+
+    - name: Instalar pacemaker, corosync y crmsh
+      apt:
+        name:
+          - pacemaker
+          - corosync
+          - crmsh
+        state: present
+        update_cache: true
+
+    -  name: Detener servicios
+       service:
+         name: "{{ item }}"
+         state: stopped
+       loop:
+         - pacemaker
+         - corosync
+
+- name: Configurar corosync (nodo1)
+  hosts: nodo1
+  become: yes
+  tasks:
+    - name: Instalar haveged
+      apt:
+        name: haveged
+        state: present
+        update_cache: true
+
+    - name: Generar clave corosync (solo en nodo1)
+      command: corosync-keygen
+      when: inventory_hostname == 'nodo1'
+      creates: /etc/corosync/authkey
+
+    - name: Limpiar archivo corosync.conf
+      copy:
+        dest: /etc/corosync/corosync.conf
+        content: ""
+
+    - name: Configurar corosync.conf
+      blockinfile:
+        path: /etc/corosync/corosync.conf
+        block: |
+          totem {
+            version: 2
+            cluster_name: lbcluster
+            transport: udpu
+            interface {
+              ringnumber: 0
+              bindnetaddr: {{ hostvars['nodo1']['ansible_host'] }}
+              broadcast: yes
+              mcastport: 5405
+            }
+          }
+
+          quorum {
+            provider: corosync_votequorum
+            two_node: 1
+          }
+
+          nodelist {
+            node {
+              ring0_addr: {{ hostvars['nodo1']['ansible_host'] }}
+              name: primary
+              nodeid: 1
+            }
+            node {
+              ring0_addr: {{ hostvars['nodo2']['ansible_host'] }}
+              name: secondary
+              nodeid: 2
+            }
+          }
+
+          logging {
+            to_logfile: yes
+            logfile: /var/log/corosync/corosync.log
+            to_syslog: yes
+            timestamp: on
+          }
+
+          service {
+            name: pacemaker
+            ver: 1
+          }
+
+- name: Iniciar servicios
+  hosts: all
+  become: yes
+  tasks:
+    - name: Iniciar y habilitar servicios
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - corosync
+        - pacemaker
+
+- name: Configurar cluster (solo en el nodo1)
+  hosts: nodo1
+  become: yes
+  tasks: 
+    - name: Deshabilitar STONITH
+      shell: |
+        crm configure property stonith-enabled=false
+        crm configure property no-quorum-policy=ignore
+
+    - name: Crear recurso de IP virtual para IP flotante
+      shell: |
+        crm configure primitive virtual_ip ocf:heartbeat:IPaddr2 params ip="{{ floating_ip }}" cidr_netmask="32" op monitor interval="10s" meta migration-threshold="10"
+
+    - name: Crear recurso webserver (LSB)
+      shell: |
+        crm configure primitive webserver lsb:nginx
+
+    - name: Crear grupo de recursos
+      shell: |
+        crm configure group hakase_balancing virtual_ip webserver
+
+    - name: Definir prioridad de los recursos
+      shell: |
+        crm configure location loc1 webserver 50: primary
+        crm configure location loc2 virtual_ip 50: primary
+        crm configure node primary priority 50
+
